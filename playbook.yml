@@ -1,0 +1,132 @@
+---
+# - name: Update /etc/hosts to add aupiq.local as localhost
+#   hosts: localhost
+#   connection: local
+#   become: yes
+#   tasks:
+#     - name: Add aupiq.local to /etc/hosts
+#       become: yes
+#       lineinfile:
+#         path: /etc/hosts
+#         line: '127.0.0.1 aupiq.local'
+#         state: present
+
+- name: Setup server environment
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+  become: yes
+  vars:
+    node_version: '18.x'
+    postgres_user: aupiq
+    postgres_password: fKX%7h,_R(]6'Mq`^dGcpb
+    github_repos:
+      - { repo: 'https://github.com/ghsamm/aupiq-pos', path: '~/aupiq-pos' }
+      - { repo: 'https://github.com/ghsamm/aupiq-pos-front', path: '~/aupiq-pos-front' }
+      - { repo: 'https://github.com/ghsamm/aupiq-pos-shared', path: '~/aupiq-front-shared' }
+
+  tasks:
+    - name: Install Node.js and npm
+      apt:
+        update_cache: yes
+        name:
+          - nodejs
+          - npm
+        state: present
+      environment:
+        NODE_VERSION: '{{ node_version }}'
+
+    - name: Install PostgreSQL
+      apt:
+        name: postgresql
+        state: present
+
+    - name: Ensure PostgreSQL is running
+      service:
+        name: postgresql
+        state: started
+        enabled: yes
+
+    - name: Configure PostgreSQL user
+      postgresql_user:
+        name: '{{ postgres_user }}'
+        password: '{{ postgres_password }}'
+        state: present
+
+    - name: Clone GitHub repositories
+      git:
+        repo: '{{ item.repo }}'
+        dest: '{{ item.path }}'
+        clone: yes
+        update: yes
+      loop: '{{ github_repos }}'
+
+    - name: Set up environment variables for each repo
+      # Use the copy module or template module to create .env files based on templates or direct content
+      # This is a placeholder task; you'll need to adjust it based on your actual environment variable needs
+      copy:
+        dest: '{{ item.path }}/.env'
+        content: |
+          # Your environment variables here
+        force: no
+      loop: '{{ github_repos }}'
+
+    - name: Install packages for each repo
+      shell: npm install
+      args:
+        chdir: '{{ item.path }}'
+      loop: '{{ github_repos }}'
+
+    - name: Install pm2
+      npm:
+        name: pm2
+        global: yes
+
+    - name: Setup pm2 for aupiq-pos
+      shell: pm2 start npm --name "aupiq-pos" -- start
+      args:
+        chdir: '{{ github_repos[0].path }}'
+        environment:
+          NODE_ENV: 'production'
+
+    - name: Build aupiq-pos-front
+      shell: npm run build
+      args:
+        chdir: '{{ github_repos[1].path }}'
+
+    - name: Setup pm2 for aupiq-pos-front
+      shell: pm2 serve build/ 80 --spa
+      args:
+        chdir: '{{ github_repos[1].path }}/dist'
+
+    - name: Save pm2 processes and configure startup
+      shell: pm2 save && pm2 startup
+
+    - name: Install Nginx
+      apt:
+        name: nginx
+        state: present
+
+    - name: Setup Nginx configuration
+      copy:
+        dest: /etc/nginx/sites-available/default
+        content: |
+          server {
+            listen 80;
+            server_name _;
+
+            location /api {
+              proxy_pass http://localhost:3000; # Adjust the port if your aupiq-pos runs on a different one
+            }
+
+            location / {
+              proxy_pass http://localhost:80; # Adjust if aupiq-pos-front serves on a different port
+              try_files $uri $uri/ /index.html;
+            }
+          }
+
+    - name: Ensure Nginx is running and enabled
+      systemd:
+        name: nginx
+        state: started
+        enabled: yes
