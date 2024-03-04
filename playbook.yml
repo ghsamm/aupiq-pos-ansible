@@ -1,7 +1,6 @@
 ---
 # - name: Update /etc/hosts to add aupiq.local as localhost
-#   hosts: localhost
-#   connection: local
+#   hosts: aupiq
 #   become: yes
 #   tasks:
 #     - name: Add aupiq.local to /etc/hosts
@@ -12,20 +11,47 @@
 #         state: present
 
 - name: Setup server environment
-  hosts: localhost
-  connection: local
-  gather_facts: yes
+  hosts: localDevServer
   become: yes
   vars:
-    node_version: '18.x'
+    src_home_dir: "/Users/sameh"
+    home_dir: "/home/aupiq"
+    src_ssh_key: "{{ src_home_dir }}/.ssh/id_rsa"
+    dest_ssh_key: "{{ home_dir }}/.ssh/id_rsa"
+    node_version: "18.x"
     postgres_user: aupiq
     postgres_password: fKX%7h,_R(]6'Mq`^dGcpb
-    github_repos:
-      - { repo: 'https://github.com/ghsamm/aupiq-pos', path: '~/aupiq-pos' }
-      - { repo: 'https://github.com/ghsamm/aupiq-pos-front', path: '~/aupiq-pos-front' }
-      - { repo: 'https://github.com/ghsamm/aupiq-pos-shared', path: '~/aupiq-front-shared' }
+    postgres_database: aupiq
+    repo_back:
+      {
+        repo: "git@github.com:ghsamm/aupiq-pos.git",
+        path: "{{ home_dir }}/aupiq-pos",
+      }
+    repo_front:
+      {
+        repo: "git@github.com:ghsamm/aupiq-pos-front.git",
+        path: "{{ home_dir }}/aupiq-pos-front",
+      }
+    repo_shared:
+      {
+        repo: "git@github.com:ghsamm/aupiq-pos-shared.git",
+        path: "{{ home_dir }}/aupiq-pos-shared",
+      }
+    repos:
+      - "{{ repo_back }}"
+      - "{{ repo_front }}"
+      - "{{ repo_shared }}"
+    frontend_port: 8080
+    backend_port: 4070
+    jwt_expires_in: "7 days"
+    jwt_secret: "S49#7q%;DtF{WHR&8X(U/6"
 
   tasks:
+    - name: Install tmux
+      ansible.builtin.apt:
+        name: tmux
+        state: present
+
     - name: Install Node.js and npm
       apt:
         update_cache: yes
@@ -34,7 +60,7 @@
           - npm
         state: present
       environment:
-        NODE_VERSION: '{{ node_version }}'
+        NODE_VERSION: "{{ node_version }}"
 
     - name: Install PostgreSQL
       apt:
@@ -47,57 +73,159 @@
         state: started
         enabled: yes
 
-    - name: Configure PostgreSQL user
-      postgresql_user:
-        name: '{{ postgres_user }}'
-        password: '{{ postgres_password }}'
+    - name: Install psycopg2, required for postgresql_user
+      apt:
+        name: python3-psycopg2
+        state: present
+        update_cache: yes
+
+    - name: Ensure the uuid-ossp extension is created
+      become_user: postgres
+      community.postgresql.postgresql_ext:
+        db: "{{ postgres_database }}"
+        name: uuid-ossp
         state: present
 
+    - name: Ensure the PostgreSQL user is present
+      become_user: postgres
+      community.general.postgresql_user:
+        login_user: postgres
+        login_password: postgres
+        name: "{{ postgres_user }}"
+        password: "{{ postgres_password }}"
+        state: present
+
+    - name: Ensure the database is present
+      become_user: postgres
+      community.general.postgresql_db:
+        login_user: postgres
+        login_password: postgres
+        name: "{{ postgres_database }}"
+        state: present
+
+    - name: Grant USAGE and CREATE on the schema to the user
+      become_user: postgres
+      community.general.postgresql_privs:
+        type: schema
+        database: "{{ postgres_database }}"
+        roles: "{{ postgres_user }}"
+        objs: public
+        privs: USAGE,CREATE
+
+    - name: Grant the user access to all tables in the database
+      become_user: postgres
+      community.general.postgresql_privs:
+        type: table
+        database: "{{ postgres_database }}"
+        roles: "{{ postgres_user }}"
+        schema: public
+        objs: ALL_IN_SCHEMA
+        privs: ALL
+
+    - name: Ensure .ssh directory exists.
+      file:
+        dest: "{{ dest_ssh_key | dirname }}"
+        mode: 0700
+        state: directory
+
+    - name: Install ssh key
+      ansible.builtin.copy:
+        src: "{{ src_ssh_key }}"
+        dest: "{{ dest_ssh_key }}"
+        mode: 0600
+
     - name: Clone GitHub repositories
-      git:
-        repo: '{{ item.repo }}'
-        dest: '{{ item.path }}'
+      ansible.builtin.git:
+        repo: "{{ item.repo }}"
+        dest: "{{ item.path }}"
         clone: yes
         update: yes
-      loop: '{{ github_repos }}'
+        key_file: "{{ dest_ssh_key }}"
+        version: main
+        force: true
+      loop: "{{ repos }}"
 
-    - name: Set up environment variables for each repo
-      # Use the copy module or template module to create .env files based on templates or direct content
-      # This is a placeholder task; you'll need to adjust it based on your actual environment variable needs
-      copy:
-        dest: '{{ item.path }}/.env'
+    - name: Remove ssh key
+      ansible.builtin.file:
+        path: "{{ dest_ssh_key }}"
+        state: absent
+
+    - name: Set up environment variables for backend
+      ansible.builtin.copy:
+        dest: "{{ repo_back.path }}/.env"
         content: |
-          # Your environment variables here
-        force: no
-      loop: '{{ github_repos }}'
+          PORT="{{ backend_port }}"
+          JWT_EXPIRES_IN = "{{ jwt_expires_in }}"
+          JWT_SECRET="{{ jwt_secret }}"
+          DB_PASSWORD="{{ postgres_password }}"
 
-    - name: Install packages for each repo
+    - name: Install npm packages for repos
       shell: npm install
       args:
-        chdir: '{{ item.path }}'
-      loop: '{{ github_repos }}'
+        chdir: "{{ item.path }}"
+      loop: "{{ repos }}"
+
+    - name: Link shared to backend
+      shell: "npm link {{ repo_shared.path }}"
+      args:
+        chdir: "{{ repo_back.path }}"
+
+    - name: Link shared to frontend
+      shell: "npm link {{ repo_shared.path }}"
+      args:
+        chdir: "{{ repo_front.path }}"
+
+    - name: Build shared
+      shell: npm run build
+      args:
+        chdir: "{{ repo_shared.path }}"
+
+    - name: Build backend
+      shell: npm run build
+      args:
+        chdir: "{{ repo_back.path }}"
+
+    - name: Build frontend
+      shell: npm run build
+      args:
+        chdir: "{{ repo_front.path }}"
 
     - name: Install pm2
       npm:
         name: pm2
         global: yes
 
-    - name: Setup pm2 for aupiq-pos
-      shell: pm2 start npm --name "aupiq-pos" -- start
-      args:
-        chdir: '{{ github_repos[0].path }}'
-        environment:
-          NODE_ENV: 'production'
+    - name: Install serve globally
+      npm:
+        name: serve
+        global: yes
+        state: latest
 
-    - name: Build aupiq-pos-front
-      shell: npm run build
-      args:
-        chdir: '{{ github_repos[1].path }}'
+    - name: delete existing pm2 processes for backend if running
+      become_user: aupiq
+      shell: "pm2 delete aupiq-pos"
+      ignore_errors: yes
 
-    - name: Setup pm2 for aupiq-pos-front
-      shell: pm2 serve build/ 80 --spa
+    - name: start pm2 process for backend
+      become_user: aupiq
+      shell: "pm2 start --name aupiq-pos dist/index.cjs"
+      environment:
+        NODE_ENV: "production"
       args:
-        chdir: '{{ github_repos[1].path }}/dist'
+        chdir: "{{ repo_back.path }}"
+
+    - name: delete existing pm2 processes for frontend if running
+      become_user: aupiq
+      shell: "pm2 delete aupiq-pos-front"
+      ignore_errors: yes
+
+    - name: start pm2 process for frontend
+      become_user: aupiq
+      shell: "pm2 --name aupiq-pos-front serve --spa dist {{ frontend_port }}"
+      environment:
+        NODE_ENV: "production"
+      args:
+        chdir: "{{ repo_front.path }}"
 
     - name: Save pm2 processes and configure startup
       shell: pm2 save && pm2 startup
@@ -109,24 +237,44 @@
 
     - name: Setup Nginx configuration
       copy:
-        dest: /etc/nginx/sites-available/default
+        dest: /etc/nginx/sites-available/aupiq-pos
         content: |
           server {
             listen 80;
             server_name _;
 
             location /api {
-              proxy_pass http://localhost:3000; # Adjust the port if your aupiq-pos runs on a different one
+              proxy_pass http://127.0.0.1:{{ backend_port }};
             }
 
             location / {
-              proxy_pass http://localhost:80; # Adjust if aupiq-pos-front serves on a different port
+              proxy_pass http://127.0.0.1:{{ frontend_port }};
               try_files $uri $uri/ /index.html;
             }
           }
+
+    - name: Enable Nginx configuration by creating a symlink
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/aupiq-pos
+        dest: /etc/nginx/sites-enabled/aupiq-pos
+        state: link
+      notify: restart nginx
+
+    - name: Remove default symlink in sites-enabled
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: restart nginx
 
     - name: Ensure Nginx is running and enabled
       systemd:
         name: nginx
         state: started
+        enabled: yes
+
+  handlers:
+    - name: restart nginx
+      systemd:
+        name: nginx
+        state: restarted
         enabled: yes
