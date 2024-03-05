@@ -79,6 +79,20 @@
         state: present
         update_cache: yes
 
+    - name: Install acl
+      apt:
+        name: acl
+        state: present
+        update_cache: yes
+
+    - name: Ensure the database is present
+      become_user: postgres
+      community.general.postgresql_db:
+        login_user: postgres
+        login_password: postgres
+        name: "{{ postgres_database }}"
+        state: present
+
     - name: Ensure the uuid-ossp extension is created
       become_user: postgres
       community.postgresql.postgresql_ext:
@@ -93,14 +107,6 @@
         login_password: postgres
         name: "{{ postgres_user }}"
         password: "{{ postgres_password }}"
-        state: present
-
-    - name: Ensure the database is present
-      become_user: postgres
-      community.general.postgresql_db:
-        login_user: postgres
-        login_password: postgres
-        name: "{{ postgres_database }}"
         state: present
 
     - name: Grant USAGE and CREATE on the schema to the user
@@ -128,6 +134,8 @@
         mode: 0700
         state: directory
 
+    # TODO not sure this is the right approach anymore
+    # should probably generate a new ssh key specifically for this machine
     - name: Install ssh key
       ansible.builtin.copy:
         src: "{{ src_ssh_key }}"
